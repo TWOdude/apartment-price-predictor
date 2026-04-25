@@ -1,24 +1,27 @@
-"""Avito apartment scraper for collecting data."""
+"""Avito apartment scraper using Selenium for dynamic content loading."""
 
 import time
+import json
 from typing import List, Dict, Optional
 from urllib.parse import urljoin
-import json
+import re
 
-import requests
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.chrome.service import Service
+from selenium.common.exceptions import TimeoutException, NoSuchElementException
+from webdriver_manager.chrome import ChromeDriverManager
 from bs4 import BeautifulSoup
 
 from scraper.config import (
     AVITO_SPB_URL,
-    DEFAULT_HEADERS,
     DELAY_BETWEEN_REQUESTS,
     DELAY_BETWEEN_PAGES,
     TARGET_LISTINGS,
     LISTINGS_PER_PAGE,
-    REQUEST_TIMEOUT,
-    MAX_RETRIES,
     OUTPUT_FILE,
-    FEATURES_TO_EXTRACT,
 )
 from scraper.utils import setup_logger, random_delay, save_to_csv, clean_price, clean_area, clean_rooms, clean_floor, clean_year
 
@@ -26,47 +29,71 @@ logger = setup_logger()
 
 
 class AvitoScraper:
-    """Scraper for Avito.ru apartment listings."""
+    """Scraper for Avito.ru apartment listings using Selenium."""
     
     def __init__(self):
-        """Initialize scraper."""
-        self.session = requests.Session()
-        self.session.headers.update(DEFAULT_HEADERS)
+        """Initialize scraper with Selenium WebDriver."""
         self.listings = []
         self.base_url = AVITO_SPB_URL
         self.logger = logger
+        self.driver = None
+        self._init_driver()
     
-    def fetch_page(self, url: str, retries: int = 0) -> Optional[BeautifulSoup]:
-        """Fetch and parse a single page.
+    def _init_driver(self):
+        """Initialize Selenium WebDriver."""
+        try:
+            options = webdriver.ChromeOptions()
+            # Убираем headless чтобы видеть что происходит (можно включить позже)
+            # options.add_argument('--headless')
+            options.add_argument('--no-sandbox')
+            options.add_argument('--disable-dev-shm-usage')
+            options.add_argument('--disable-gpu')
+            options.add_argument('--window-size=1920,1080')
+            options.add_argument('user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
+            
+            # Автоматическая установка ChromeDriver
+            service = Service(ChromeDriverManager().install())
+            self.driver = webdriver.Chrome(service=service, options=options)
+            self.logger.info("WebDriver initialized successfully")
+        except Exception as e:
+            self.logger.error(f"Error initializing WebDriver: {e}")
+            self.logger.info("Installing ChromeDriver automatically...")
+            raise
+    
+    def fetch_page(self, url: str, wait_time: int = 10) -> bool:
+        """Fetch page using Selenium and wait for content to load.
         
         Args:
             url: URL to fetch
-            retries: Current retry attempt
+            wait_time: Maximum time to wait for content (seconds)
         
         Returns:
-            BeautifulSoup object or None if failed
+            True if successful, False otherwise
         """
         try:
-            self.logger.info(f"Fetching: {url}")
-            response = self.session.get(url, timeout=REQUEST_TIMEOUT)
-            response.raise_for_status()
+            self.logger.info(f"Loading page: {url}")
+            self.driver.get(url)
             
-            return BeautifulSoup(response.content, 'html.parser')
+            # Ждём, пока элементы загрузятся
+            # Ищем контейнер со списком объявлений
+            wait = WebDriverWait(self.driver, wait_time)
+            
+            # Пытаемся найти список объявлений
+            # Авито использует разные селекторы, пробуем несколько
+            try:
+                wait.until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, "[data-item-id]")))
+                self.logger.info("Items found on page")
+            except TimeoutException:
+                self.logger.warning("Timeout waiting for items, continuing anyway...")
+            
+            return True
         
-        except requests.exceptions.RequestException as e:
-            if retries < MAX_RETRIES:
-                self.logger.warning(f"Error fetching {url}, retrying... ({retries + 1}/{MAX_RETRIES})")
-                random_delay(5, 10)
-                return self.fetch_page(url, retries + 1)
-            else:
-                self.logger.error(f"Failed to fetch {url} after {MAX_RETRIES} retries: {e}")
-                return None
+        except Exception as e:
+            self.logger.error(f"Error fetching page {url}: {e}")
+            return False
     
-    def extract_listings_from_page(self, soup: BeautifulSoup) -> List[Dict]:
-        """Extract apartment listings from page.
-        
-        Args:
-            soup: BeautifulSoup object
+    def extract_listings_from_page(self) -> List[Dict]:
+        """Extract apartment listings from loaded page.
         
         Returns:
             List of apartment dictionaries
@@ -74,9 +101,13 @@ class AvitoScraper:
         listings = []
         
         try:
-            # Find all listing items
-            # Note: Avito's HTML structure changes frequently, adjust selectors as needed
-            items = soup.find_all('div', {'data-item-id': True})
+            # Даём странице время на полную загрузку
+            time.sleep(3)
+            
+            soup = BeautifulSoup(self.driver.page_source, 'html.parser')
+            
+            # Ищем элементы с data-item-id атрибутом
+            items = soup.find_all(attrs={'data-item-id': True})
             
             self.logger.info(f"Found {len(items)} items on page")
             
@@ -106,52 +137,104 @@ class AvitoScraper:
         try:
             listing = {}
             
-            # Extract item ID and URL
+            # Получаем item_id
             item_id = item.get('data-item-id')
-            url_element = item.find('a', {'class': 'title-root'})
+            if not item_id:
+                return None
             
-            if url_element and url_element.get('href'):
-                listing['url'] = urljoin(self.base_url, url_element['href'])
-                listing['item_id'] = item_id
+            listing['item_id'] = item_id
+            
+            # Ищем ссылку на объявление
+            link = item.find('a', href=True)
+            if link:
+                url = link.get('href', '')
+                listing['url'] = urljoin(self.base_url, url) if not url.startswith('http') else url
             else:
                 return None
             
-            # Extract title (contains rooms, area info)
-            title_element = item.find('h3', {'class': 'title-root'})
-            if title_element:
-                listing['title'] = title_element.get_text(strip=True)
+            # Получаем текст элемента для парсинга
+            text = item.get_text(strip=True)
             
-            # Extract price
-            price_element = item.find('span', {'class': 'price-text'})
-            if price_element:
-                price_text = price_element.get_text(strip=True)
-                listing['price'] = clean_price(price_text)
+            # Ищем цену - обычно это число с пробелами и ₽
+            price_match = re.search(r'(\d[\d\s]+)\s*₽', text)
+            if price_match:
+                price_text = price_match.group(1).replace(' ', '')
+                try:
+                    listing['price'] = int(price_text)
+                except ValueError:
+                    listing['price'] = None
+            else:
+                # Объявление может быть без цены
+                listing['price'] = None
             
-            # Extract location/district
-            location_element = item.find('div', {'class': 'geo'})
-            if location_element:
-                listing['district'] = location_element.get_text(strip=True)
+            # Ищем площадь (м²)
+            area_match = re.search(r'(\d+[.,]\d*|\d+)\s*м²', text)
+            if area_match:
+                area_text = area_match.group(1).replace(',', '.')
+                try:
+                    listing['area'] = float(area_text)
+                except ValueError:
+                    listing['area'] = None
+            else:
+                listing['area'] = None
             
-            # Extract additional info (area, rooms, etc.)
-            info_elements = item.find_all('div', {'class': 'info-row'})
-            for info in info_elements:
-                text = info.get_text(strip=True)
-                
-                if 'м²' in text:
-                    listing['area'] = clean_area(text)
-                elif '-к' in text or 'студия' in text:
-                    listing['rooms'] = clean_rooms(text)
+            # Ищем количество комнат
+            # Ищем паттерны типа "1-к", "2-к", "студия"
+            if 'студия' in text.lower():
+                listing['rooms'] = 1
+            else:
+                rooms_match = re.search(r'(\d+)\s*-?к', text)
+                if rooms_match:
+                    try:
+                        listing['rooms'] = int(rooms_match.group(1))
+                    except ValueError:
+                        listing['rooms'] = None
+                else:
+                    listing['rooms'] = None
             
-            # Extract date
-            date_element = item.find('div', {'class': 'date'})
-            if date_element:
-                listing['posted_date'] = date_element.get_text(strip=True)
+            # Ищем этаж
+            floor_match = re.search(r'(\d+)\s*[из/]\s*(\d+)', text)
+            if floor_match:
+                try:
+                    listing['floor'] = int(floor_match.group(1))
+                    listing['total_floors'] = int(floor_match.group(2))
+                except ValueError:
+                    listing['floor'] = None
+                    listing['total_floors'] = None
+            else:
+                listing['floor'] = None
+                listing['total_floors'] = None
             
-            return listing if listing.get('price') else None
+            # Ищем название/заголовок
+            title = item.find(['h1', 'h2', 'h3', 'span', 'div'], class_=re.compile('title|name|heading'))
+            if title:
+                listing['title'] = title.get_text(strip=True)
+            else:
+                listing['title'] = text[:100]
+            
+            # Район (обычно последняя часть текста)
+            listing['district'] = None
+            
+            # Вернуть только если есть хоть какие-то данные
+            if listing.get('price'):
+                return listing
+            
+            return None
         
         except Exception as e:
             self.logger.warning(f"Error parsing listing item: {e}")
             return None
+    
+    def scroll_page(self):
+        """Scroll page to load more items dynamically."""
+        try:
+            # Скроллим страницу вниз несколько раз
+            for _ in range(3):
+                self.driver.execute_script("window.scrollBy(0, window.innerHeight);")
+                time.sleep(1)
+            self.logger.info("Page scrolled")
+        except Exception as e:
+            self.logger.warning(f"Error scrolling page: {e}")
     
     def get_next_page_url(self, current_page: int) -> str:
         """Generate URL for next page.
@@ -176,29 +259,35 @@ class AvitoScraper:
         page = 1
         max_pages = (TARGET_LISTINGS // LISTINGS_PER_PAGE) + 2
         
-        while len(self.listings) < TARGET_LISTINGS and page <= max_pages:
-            try:
-                url = self.get_next_page_url(page)
-                soup = self.fetch_page(url)
+        try:
+            while len(self.listings) < TARGET_LISTINGS and page <= max_pages:
+                try:
+                    url = self.get_next_page_url(page)
+                    
+                    if not self.fetch_page(url):
+                        self.logger.warning(f"Failed to fetch page {page}, stopping")
+                        break
+                    
+                    # Скроллим для загрузки дополнительных элементов
+                    self.scroll_page()
+                    
+                    page_listings = self.extract_listings_from_page()
+                    self.listings.extend(page_listings)
+                    
+                    self.logger.info(f"Page {page}: collected {len(page_listings)} listings (total: {len(self.listings)})")
+                    
+                    if len(self.listings) < TARGET_LISTINGS and page < max_pages:
+                        random_delay(DELAY_BETWEEN_PAGES, DELAY_BETWEEN_PAGES + 3)
+                    
+                    page += 1
                 
-                if not soup:
-                    self.logger.warning(f"Failed to fetch page {page}, stopping")
-                    break
-                
-                page_listings = self.extract_listings_from_page(soup)
-                self.listings.extend(page_listings)
-                
-                self.logger.info(f"Page {page}: collected {len(page_listings)} listings (total: {len(self.listings)})")
-                
-                if len(self.listings) < TARGET_LISTINGS:
-                    random_delay(DELAY_BETWEEN_PAGES, DELAY_BETWEEN_PAGES + 3)
-                
-                page += 1
-            
-            except Exception as e:
-                self.logger.error(f"Error on page {page}: {e}")
-                page += 1
-                continue
+                except Exception as e:
+                    self.logger.error(f"Error on page {page}: {e}")
+                    page += 1
+                    continue
+        
+        finally:
+            self.close()
         
         self.logger.info(f"Scraping completed. Total listings: {len(self.listings)}")
         return self.listings
@@ -214,6 +303,15 @@ class AvitoScraper:
         
         save_to_csv(self.listings, filepath)
         self.logger.info(f"Data saved to {filepath}")
+    
+    def close(self):
+        """Close WebDriver."""
+        try:
+            if self.driver:
+                self.driver.quit()
+                self.logger.info("WebDriver closed")
+        except Exception as e:
+            self.logger.warning(f"Error closing WebDriver: {e}")
 
 
 def main():
